@@ -7,12 +7,11 @@ import asyncio
 import io
 import re
 from keep_live import keep_alive
+
 from discord.ext import commands, tasks
 from discord import app_commands, Embed, PermissionOverwrite
 import discord.ui as ui
 
-load_dotenv()
-token = os.getenv('DISCORD_TOKEN')
 # ---------- Constantes ----------
 DATA_FILES = {
     "films": "data/films.json",
@@ -28,14 +27,6 @@ VOICE_CHANNEL_MAP = {
     "jeux": "Jeux disponibles",
     "logiciels": "Logiciels disponibles",
 }
-
-# --- CONFIGURATION DU SALON D'ARRIVANTS ---
-# REMPLACEZ 'NOM_DU_SALON_ACCUEIL' par le nom exact de votre salon de bienvenue (ex: "bienvenue", "general", "accueil")
-# Assurez-vous que le bot a les permissions de voir le salon et d'y envoyer des messages.
-WELCOME_CHANNEL_NAME = "general" 
-# Ou si vous préférez utiliser l'ID direct pour plus de fiabilité :
-# WELCOME_CHANNEL_ID = 123456789012345678 # Décommentez et remplacez par l'ID de votre salon
-# ------------------------------------------
 
 os.makedirs("data", exist_ok=True)
 
@@ -89,8 +80,6 @@ def save_data(category: str, data: dict):
 intents = discord.Intents.default()
 intents.messages = True
 intents.guilds = True
-# NOUVELLE LIGNE : Nécessaire pour détecter les arrivées de membres
-intents.members = True 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------- Autocomplétion pour les Commandes Slash ----------
@@ -144,7 +133,7 @@ class PaginatedView(ui.View):
         self.embed_title = embed_title
         self.embed_color = embed_color
         self.item_category_singular = item_category_singular # Pour l'affichage (film, série, jeu)
-        self.data_file_category = data_file_category         # Pour charger les données (films, series, jeux)
+        self.data_file_category = data_file_category       # Pour charger les données (films, series, jeux)
         self.current_page = 0
         self.message: discord.Message = None 
         self.update_buttons()
@@ -680,351 +669,513 @@ async def postdemande(interaction: discord.Interaction, message: str):
 # ---------- Commandes Slash Générales (Ajouter/Supprimer/Obtenir) ----------
 async def add_item_command(interaction: discord.Interaction, category: str, titre: str, url: str, image: str | None = None, themes: str | None = None):
     """Fonction générique pour ajouter un élément à une catégorie (hors séries)."""
-    await interaction.response.defer(ephemeral=False)
-    
-    current_data = load_data(category)
+    await interaction.response.defer(ephemeral=False) 
+
     key = titre.lower()
+    data = {"url": url, "image": image}
+    if themes:
+        data['themes'] = [g.strip().lower() for g in themes.split(',')]
 
-    if key in current_data:
-        return await interaction.followup.send(f"❌ Cet {category[:-1] if category.endswith('s') else category} existe déjà.", ephemeral=True)
-
-    item_data = {
-        "url": url,
-        "image": image if image else "",
-        "themes": [t.strip().lower() for t in themes.split(',')] if themes else [],
-        "rating": None, # Initialiser la note à None
-        "ratings": [] 
-    }
-    current_data[key] = item_data
+    current_data = load_data(category)
+    current_data[key] = data
     save_data(category, current_data)
-    await interaction.followup.send(f"✅ {titre.title()} ajouté aux {category}!")
 
-# Films
-@bot.tree.command(name="addfilm", description="Ajouter un film")
-@app_commands.describe(titre="Titre du film", url="Lien du film", image="Lien de l'image (optionnel)", themes="Thèmes séparés par des virgules (action,horreur) (optionnel)")
+    response_embed = Embed(
+        title=f"✅ {titre.title()} ajouté à la catégorie {category.title()} !",
+        description=f"Lien : [Cliquez ici]({url})",
+        color=0x1abc9c
+    )
+    if image:
+        response_embed.set_image(url=image)
+    if themes:
+        response_embed.add_field(name="Genres/Thèmes", value=", ".join([g.title() for g in data['themes']]), inline=False)
+
+    await interaction.followup.send(
+        embed=response_embed,
+        view=ItemDetailsView(category, key) 
+    )
+    await update_search_channel_embed(interaction.guild, category)
+    await update_voice_channel_names_for_guild(interaction.guild)
+
+
+async def del_item_command(interaction: discord.Interaction, category: str, titre: str):
+    """Fonction générique pour supprimer un élément d'une catégorie (hors séries)."""
+    key = titre.lower()
+    current_data = load_data(category)
+    if key in current_data:
+        current_data.pop(key)
+        save_data(category, current_data)
+        await interaction.response.send_message(f"🗑️ {category.title()} **{titre.title()}** supprimé.")
+        await update_search_channel_embed(interaction.guild, category)
+        await update_voice_channel_names_for_guild(interaction.guild)
+    else:
+        await interaction.response.send_message(f"❌ {category.title()} introuvable.", ephemeral=True)
+
+async def get_item_command(interaction: discord.Interaction, category: str, titre: str):
+    """Fonction générique pour obtenir et afficher les détails d'un élément."""
+    key = titre.lower()
+    current_data = load_data(category)
+    if key in current_data:
+        await interaction.response.send_message(
+            embed=make_item_embed(category, key, current_data[key]),
+            view=ItemDetailsView(category, key),
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(f"❌ {category.title()} introuvable.", ephemeral=True)
+
+# ---------- Commandes Slash Spécifiques (Ajouter/Supprimer/Obtenir par Catégorie) ----------
+# Films, Jeux, Logiciels
+@bot.tree.command(description="Ajouter un film à la base de données (Admin)")
+@app_commands.describe(titre="Titre complet", url="Lien vers le film", image="Lien de l'image", themes="Genres (séparés par des virgules)")
 @app_commands.default_permissions(manage_guild=True)
 async def addfilm(interaction: discord.Interaction, titre: str, url: str, image: str | None = None, themes: str | None = None):
     await add_item_command(interaction, "films", titre, url, image, themes)
 
-@bot.tree.command(name="delfilm", description="Supprimer un film")
+@bot.tree.command(description="Supprimer un film (Admin)")
 @app_commands.describe(titre="Titre du film à supprimer")
 @app_commands.autocomplete(titre=autocomplete_item_title)
 @app_commands.default_permissions(manage_guild=True)
 async def delfilm(interaction: discord.Interaction, titre: str):
-    await interaction.response.defer(ephemeral=True)
-    current_data = load_data("films")
-    key = titre.lower()
-    if key in current_data:
-        del current_data[key]
-        save_data("films", current_data)
-        await interaction.followup.send(f"✅ Film '{titre.title()}' supprimé.")
-    else:
-        await interaction.followup.send(f"❌ Film '{titre.title()}' introuvable.")
+    await del_item_command(interaction, "films", titre)
 
-@bot.tree.command(name="getfilm", description="Obtenir les détails d'un film")
+@bot.tree.command(description="Afficher les détails d'un film")
 @app_commands.describe(titre="Titre du film")
 @app_commands.autocomplete(titre=autocomplete_item_title)
 async def getfilm(interaction: discord.Interaction, titre: str):
-    current_data = load_data("films")
-    key = titre.lower()
-    if key in current_data:
-        film_info = current_data[key]
-        await interaction.response.send_message(
-            embed=make_item_embed("films", titre, film_info),
-            view=ItemDetailsView("films", titre),
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(f"❌ Film '{titre.title()}' introuvable.", ephemeral=True)
+    await get_item_command(interaction, "films", titre)
 
-# Jeux
-@bot.tree.command(name="addjeu", description="Ajouter un jeu")
-@app_commands.describe(nom="Nom du jeu", url="Lien du jeu", image="Lien de l'image (optionnel)", themes="Thèmes séparés par des virgules (action,rpg) (optionnel)")
+@bot.tree.command(description="Ajouter un jeu (Admin)")
+@app_commands.describe(titre="Nom complet", url="Lien vers le jeu", image="Lien de l'image", themes="Genres (séparés par des virgules)")
 @app_commands.default_permissions(manage_guild=True)
-async def addjeu(interaction: discord.Interaction, nom: str, url: str, image: str | None = None, themes: str | None = None):
-    await add_item_command(interaction, "jeux", nom, url, image, themes)
+async def addjeu(interaction: discord.Interaction, titre: str, url: str, image: str | None = None, themes: str | None = None):
+    await add_item_command(interaction, "jeux", titre, url, image, themes)
 
-@bot.tree.command(name="deljeu", description="Supprimer un jeu")
-@app_commands.describe(nom="Nom du jeu à supprimer")
-@app_commands.autocomplete(nom=autocomplete_item_title)
+@bot.tree.command(description="Supprimer un jeu (Admin)")
+@app_commands.describe(titre="Nom du jeu à supprimer")
+@app_commands.autocomplete(titre=autocomplete_item_title)
 @app_commands.default_permissions(manage_guild=True)
-async def deljeu(interaction: discord.Interaction, nom: str):
-    await interaction.response.defer(ephemeral=True)
-    current_data = load_data("jeux")
-    key = nom.lower()
-    if key in current_data:
-        del current_data[key]
-        save_data("jeux", current_data)
-        await interaction.followup.send(f"✅ Jeu '{nom.title()}' supprimé.")
-    else:
-        await interaction.followup.send(f"❌ Jeu '{nom.title()}' introuvable.")
+async def deljeu(interaction: discord.Interaction, titre: str):
+    await del_item_command(interaction, "jeux", titre)
 
-@bot.tree.command(name="getjeu", description="Obtenir les détails d'un jeu")
-@app_commands.describe(nom="Nom du jeu")
-@app_commands.autocomplete(nom=autocomplete_item_title)
-async def getjeu(interaction: discord.Interaction, nom: str):
-    current_data = load_data("jeux")
-    key = nom.lower()
-    if key in current_data:
-        jeu_info = current_data[key]
-        await interaction.response.send_message(
-            embed=make_item_embed("jeux", nom, jeu_info),
-            view=ItemDetailsView("jeux", nom),
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(f"❌ Jeu '{nom.title()}' introuvable.", ephemeral=True)
+@bot.tree.command(description="Afficher les détails d'un jeu")
+@app_commands.describe(titre="Nom du jeu")
+@app_commands.autocomplete(titre=autocomplete_item_title)
+async def getjeu(interaction: discord.Interaction, titre: str):
+    await get_item_command(interaction, "jeux", titre)
 
-# Logiciels
-@bot.tree.command(name="addlogiciel", description="Ajouter un logiciel")
-@app_commands.describe(nom="Nom du logiciel", url="Lien du logiciel", image="Lien de l'image (optionnel)", themes="Thèmes séparés par des virgules (bureautique,graphisme) (optionnel)")
+@bot.tree.command(description="Ajouter un logiciel (Admin)")
+@app_commands.describe(titre="Nom complet", url="Lien vers le logiciel", image="Lien de l'image", themes="Catégories (séparés par des virgules)")
 @app_commands.default_permissions(manage_guild=True)
-async def addlogiciel(interaction: discord.Interaction, nom: str, url: str, image: str | None = None, themes: str | None = None):
-    await add_item_command(interaction, "logiciels", nom, url, image, themes)
+async def addlogiciel(interaction: discord.Interaction, titre: str, url: str, image: str | None = None, themes: str | None = None):
+    await add_item_command(interaction, "logiciels", titre, url, image, themes)
 
-@bot.tree.command(name="dellogiciel", description="Supprimer un logiciel")
-@app_commands.describe(nom="Nom du logiciel à supprimer")
-@app_commands.autocomplete(nom=autocomplete_item_title)
+@bot.tree.command(description="Supprimer un logiciel (Admin)")
+@app_commands.describe(titre="Nom du logiciel à supprimer")
+@app_commands.autocomplete(titre=autocomplete_item_title)
 @app_commands.default_permissions(manage_guild=True)
-async def dellogiciel(interaction: discord.Interaction, nom: str):
-    await interaction.response.defer(ephemeral=True)
-    current_data = load_data("logiciels")
-    key = nom.lower()
-    if key in current_data:
-        del current_data[key]
-        save_data("logiciels", current_data)
-        await interaction.followup.send(f"✅ Logiciel '{nom.title()}' supprimé.")
-    else:
-        await interaction.followup.send(f"❌ Logiciel '{nom.title()}' introuvable.")
+async def dellogiciel(interaction: discord.Interaction, titre: str):
+    await del_item_command(interaction, "logiciels", titre)
 
-@bot.tree.command(name="getlogiciel", description="Obtenir les détails d'un logiciel")
-@app_commands.describe(nom="Nom du logiciel")
-@app_commands.autocomplete(nom=autocomplete_item_title)
-async def getlogiciel(interaction: discord.Interaction, nom: str):
-    current_data = load_data("logiciels")
-    key = nom.lower()
-    if key in current_data:
-        logiciel_info = current_data[key]
-        await interaction.response.send_message(
-            embed=make_item_embed("logiciels", nom, logiciel_info),
-            view=ItemDetailsView("logiciels", nom),
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(f"❌ Logiciel '{nom.title()}' introuvable.", ephemeral=True)
+@bot.tree.command(description="Afficher les détails d'un logiciel")
+@app_commands.describe(titre="Nom du logiciel")
+@app_commands.autocomplete(titre=autocomplete_item_title)
+async def getlogiciel(interaction: discord.Interaction, titre: str):
+    await get_item_command(interaction, "logiciels", titre)
 
-# Séries (gestion des saisons)
-@bot.tree.command(name="addserieseason", description="Ajouter ou modifier une série et une saison")
-@app_commands.describe(titre="Titre de la série", saison_numero="Numéro de la saison", saison_url="Lien de la saison", image="Lien de l'image (optionnel)", themes="Thèmes séparés par des virgules (drame,sci-fi) (optionnel)")
+# --- COMMANDES SPÉCIFIQUES AUX SÉRIES (NOUVELLES LOGIQUES) ---
+@bot.tree.command(name="addserieseason", description="Ajouter ou mettre à jour une saison pour une série (Admin)")
+@app_commands.describe(
+    titre="Titre de la série",
+    season_number="Numéro de la saison",
+    season_url="Lien de la saison",
+    season_title="Titre de la saison (ex: Arc du train de l'infini, laisser vide pour 'Saison X')",
+    image="Lien de l'image de la série (utilisé seulement si nouvelle série)",
+    themes="Genres de la série (séparés par des virgules, utilisé seulement si nouvelle série)"
+)
 @app_commands.default_permissions(manage_guild=True)
-async def addserieseason(interaction: discord.Interaction, titre: str, saison_numero: int, saison_url: str, image: str | None = None, themes: str | None = None):
+async def addserieseason(
+    interaction: discord.Interaction,
+    titre: str,
+    season_number: int,
+    season_url: str,
+    season_title: str | None = None,
+    image: str | None = None,
+    themes: str | None = None
+):
     await interaction.response.defer(ephemeral=False)
-    
-    current_data = load_data("series")
-    key = titre.lower()
 
-    # Si la série n'existe pas, la créer
+    key = titre.lower()
+    current_data = load_data("series")
+
     if key not in current_data:
-        current_data[key] = {
-            "image": image if image else "",
-            "themes": [t.strip().lower() for t in themes.split(',')] if themes else [],
-            "rating": None,
-            "ratings": [],
+        new_series_data = {
+            "image": image,
+            "themes": [g.strip().lower() for g in themes.split(',')] if themes else [],
             "seasons": []
         }
+        current_data[key] = new_series_data
+        response_msg_start = f"✅ Nouvelle série **{titre.title()}** créée."
     else:
-        # Si la série existe, mettre à jour l'image et les thèmes si fournis
+        response_msg_start = f"✅ Série **{titre.title()}** mise à jour."
         if image:
             current_data[key]["image"] = image
         if themes:
-            current_data[key]["themes"] = [t.strip().lower() for t in themes.split(',')]
-
-    # Vérifier si la saison existe déjà
+            current_data[key]["themes"] = [g.strip().lower() for g in themes.split(',')]
+    
     season_exists = False
-    for season in current_data[key]["seasons"]:
-        if season.get("number") == saison_numero:
-            season["url"] = saison_url
-            season["title"] = f"Saison {saison_numero}" # Mettre à jour le titre de la saison
+    for i, season in enumerate(current_data[key]["seasons"]):
+        if season.get("number") == season_number:
+            current_data[key]["seasons"][i]["url"] = season_url
+            current_data[key]["seasons"][i]["title"] = season_title if season_title else f"Saison {season_number}"
             season_exists = True
+            response_msg_start += f" La saison {season_number} a été mise à jour."
             break
     
     if not season_exists:
-        current_data[key]["seasons"].append({
-            "number": saison_numero,
-            "title": f"Saison {saison_numero}",
-            "url": saison_url
-        })
-    
-    save_data("series", current_data)
-    await interaction.followup.send(f"✅ Série '{titre.title()}' - Saison {saison_numero} ajoutée/modifiée avec succès!")
+        new_season = {
+            "number": season_number,
+            "title": season_title if season_title else f"Saison {season_number}",
+            "url": season_url
+        }
+        current_data[key]["seasons"].append(new_season)
+        response_msg_start += f" La saison {season_number} a été ajoutée."
+        current_data[key]["seasons"].sort(key=lambda s: s.get('number', 0))
 
-@bot.tree.command(name="delserieseason", description="Supprimer une saison spécifique d'une série")
-@app_commands.describe(titre="Titre de la série", saison_numero="Numéro de la saison à supprimer")
+    save_data("series", current_data)
+
+    embed = Embed(
+        title=response_msg_start,
+        description=f"La série **{titre.title()}** a été mise à jour avec les informations suivantes :",
+        color=0x1abc9c
+    )
+    if current_data[key].get("image"): 
+        embed.set_image(url=current_data[key]["image"])
+    if current_data[key].get("themes"):
+        embed.add_field(name="Genres/Thèmes", value=", ".join([t.title() for t in current_data[key]['themes']]), inline=False)
+    
+    await interaction.followup.send(embed=embed)
+    await update_search_channel_embed(interaction.guild, "series")
+    await update_voice_channel_names_for_guild(interaction.guild)
+
+@bot.tree.command(name="delserieseason", description="Supprimer une saison spécifique d'une série (Admin)")
+@app_commands.describe(
+    titre="Titre de la série",
+    season_number="Numéro de la saison à supprimer"
+)
 @app_commands.autocomplete(titre=autocomplete_item_title)
 @app_commands.default_permissions(manage_guild=True)
-async def delserieseason(interaction: discord.Interaction, titre: str, saison_numero: int):
-    await interaction.response.defer(ephemeral=True)
-    current_data = load_data("series")
+async def delserieseason(interaction: discord.Interaction, titre: str, season_number: int):
     key = titre.lower()
+    current_data = load_data("series")
 
     if key not in current_data:
-        return await interaction.followup.send(f"❌ Série '{titre.title()}' introuvable.")
+        return await interaction.response.send_message(f"❌ Série **{titre.title()}** introuvable.", ephemeral=True)
+
+    seasons = current_data[key].get("seasons", [])
     
-    original_season_count = len(current_data[key].get("seasons", []))
-    current_data[key]["seasons"] = [
-        s for s in current_data[key].get("seasons", []) if s.get("number") != saison_numero
-    ]
-
-    if len(current_data[key]["seasons"]) < original_season_count:
-        if not current_data[key]["seasons"] and not current_data[key].get("image") and not current_data[key].get("themes"):
-            # Si plus aucune saison, image ou thèmes, supprimer la série entière
-            del current_data[key]
-            save_data("series", current_data)
-            await interaction.followup.send(f"✅ Série '{titre.title()}' (et sa dernière saison) supprimée car il n'y avait plus de contenu lié.")
-        else:
-            save_data("series", current_data)
-            await interaction.followup.send(f"✅ Saison {saison_numero} de la série '{titre.title()}' supprimée.")
+    initial_season_count = len(seasons)
+    current_data[key]["seasons"] = [s for s in seasons if s.get("number") != season_number]
+    
+    if len(current_data[key]["seasons"]) == initial_season_count:
+        return await interaction.response.send_message(f"❌ Saison {season_number} introuvable pour la série **{titre.title()}**.", ephemeral=True)
+    
+    if not current_data[key]["seasons"]:
+        current_data.pop(key)
+        response_msg = f"🗑️ Saison {season_number} de **{titre.title()}** supprimée. C'était la dernière saison, donc la série a été complètement supprimée."
     else:
-        await interaction.followup.send(f"❌ Saison {saison_numero} de la série '{titre.title()}' introuvable.")
+        response_msg = f"🗑️ Saison {season_number} de **{titre.title()}** supprimée."
+        
+    save_data("series", current_data)
+    await interaction.response.send_message(response_msg)
+    await update_search_channel_embed(interaction.guild, "series")
+    await update_voice_channel_names_for_guild(interaction.guild)
 
-@bot.tree.command(name="delseries", description="Supprimer une série entière (toutes les saisons)")
-@app_commands.describe(titre="Titre de la série à supprimer")
+@bot.tree.command(name="delseries", description="Supprimer une série entière (Admin)")
+@app_commands.describe(titre="Titre de la série à supprimer entièrement")
 @app_commands.autocomplete(titre=autocomplete_item_title)
 @app_commands.default_permissions(manage_guild=True)
 async def delseries(interaction: discord.Interaction, titre: str):
-    await interaction.response.defer(ephemeral=True)
-    current_data = load_data("series")
-    key = titre.lower()
-    if key in current_data:
-        del current_data[key]
-        save_data("series", current_data)
-        await interaction.followup.send(f"✅ Série '{titre.title()}' (toutes les saisons) supprimée.")
-    else:
-        await interaction.followup.send(f"❌ Série '{titre.title()}' introuvable.")
+    await del_item_command(interaction, "series", titre)
 
-@bot.tree.command(name="getserie", description="Obtenir les détails d'une série")
+@bot.tree.command(description="Afficher les détails d'une série")
 @app_commands.describe(titre="Titre de la série")
 @app_commands.autocomplete(titre=autocomplete_item_title)
 async def getserie(interaction: discord.Interaction, titre: str):
-    current_data = load_data("series")
+    await get_item_command(interaction, "series", titre)
+
+@bot.tree.command(name="importseries", description="Ajoute une série avec plusieurs saisons en une seule fois (Admin)")
+@app_commands.describe(
+    titre="Titre de la série",
+    saisons_data="Saisons au format 'S1:lien.com,S2:lien.com' (séparées par des virgules)",
+    image="Lien de l'image de la série",
+    themes="Genres de la série (séparés par des virgules)"
+)
+@app_commands.default_permissions(manage_guild=True)
+async def importseries(
+    interaction: discord.Interaction,
+    titre: str,
+    saisons_data: str,
+    image: str | None = None,
+    themes: str | None = None
+):
+    await interaction.response.defer(ephemeral=False)
+
     key = titre.lower()
-    if key in current_data:
-        serie_info = current_data[key]
-        await interaction.response.send_message(
-            embed=make_item_embed("series", titre, serie_info),
-            view=ItemDetailsView("series", titre),
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(f"❌ Série '{titre.title()}' introuvable.", ephemeral=True)
-
-# ---------- Importation de données (staff) ----------
-@bot.tree.command(name="importfilms", description="Importer un fichier JSON de films (Staff)")
-@app_commands.describe(file="Le fichier JSON à importer")
-@app_commands.default_permissions(manage_guild=True)
-async def importfilms(interaction: discord.Interaction, file: discord.Attachment):
-    await import_data_command(interaction, "films", file)
-
-@bot.tree.command(name="importseries", description="Importer un fichier JSON de séries (Staff)")
-@app_commands.describe(file="Le fichier JSON à importer")
-@app_commands.default_permissions(manage_guild=True)
-async def importseries(interaction: discord.Interaction, file: discord.Attachment):
-    await import_data_command(interaction, "series", file)
-
-@bot.tree.command(name="importjeux", description="Importer un fichier JSON de jeux (Staff)")
-@app_commands.describe(file="Le fichier JSON à importer")
-@app_commands.default_permissions(manage_guild=True)
-async def importjeux(interaction: discord.Interaction, file: discord.Attachment):
-    await import_data_command(interaction, "jeux", file)
-
-@bot.tree.command(name="importlogiciels", description="Importer un fichier JSON de logiciels (Staff)")
-@app_commands.describe(file="Le fichier JSON à importer")
-@app_commands.default_permissions(manage_guild=True)
-async def importlogiciels(interaction: discord.Interaction, file: discord.Attachment):
-    await import_data_command(interaction, "logiciels", file)
-
-async def import_data_command(interaction: discord.Interaction, category: str, file: discord.Attachment):
-    await interaction.response.defer(ephemeral=True)
-    if not file.filename.endswith(".json"):
-        return await interaction.followup.send("❌ Veuillez n'importer que des fichiers JSON.", ephemeral=True)
-
-    try:
-        data_bytes = await file.read()
-        new_data = json.loads(data_bytes.decode('utf-8'))
-
-        current_data = load_data(category)
-        
-        # Merge new data into existing data
-        for key, value in new_data.items():
-            current_data[key.lower()] = value
-        
-        save_data(category, current_data)
-        await interaction.followup.send(f"✅ Données pour les {category} importées et fusionnées avec succès!")
-    except json.JSONDecodeError:
-        await interaction.followup.send("❌ Le fichier JSON est invalide.", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Une erreur est survenue lors de l'importation: {e}", ephemeral=True)
-
-# ---------- Événements du Bot ----------
-@bot.event
-async def on_ready():
-    print(f'{bot.user.name} est connecté et prêt !')
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synchronisation de {len(synced)} commandes slash.")
-    except Exception as e:
-        print(f"Erreur lors de la synchronisation des commandes slash : {e}")
-
-    # Relancer les vues persistantes
-    bot.add_view(FilmSearchView())
-    bot.add_view(SerieSearchView())
-    bot.add_view(JeuSearchView())
-    bot.add_view(LogicielSearchView())
-    bot.add_view(TicketView())
-    bot.add_view(TicketCloseView())
-
-# NOUVELLE FONCTION : Gestionnaire d'événement pour les nouveaux membres
-@bot.event
-async def on_member_join(member):
-    """
-    Se déclenche lorsqu'un nouveau membre rejoint le serveur.
-    """
-    # Tente de trouver le salon d'accueil par son nom
-    welcome_channel = discord.utils.get(member.guild.text_channels, name=WELCOME_CHANNEL_NAME)
+    current_data = load_data("series")
     
-    # Si vous avez défini WELCOME_CHANNEL_ID, utilisez-le pour plus de fiabilité
-    # welcome_channel = bot.get_channel(WELCOME_CHANNEL_ID) 
+    if key not in current_data:
+        current_data[key] = {
+            "image": image,
+            "themes": [g.strip().lower() for g in themes.split(',')] if themes else [],
+            "seasons": []
+        }
+        response_msg_start = f"✅ Nouvelle série **{titre.title()}** créée."
+    else:
+        response_msg_start = f"✅ Série **{titre.title()}** mise à jour."
+        if image:
+            current_data[key]["image"] = image
+        if themes:
+            current_data[key]["themes"] = [g.strip().lower() for g in themes.split(',')]
 
-    if welcome_channel:
-        embed = discord.Embed(
-            title=f"🎉 Bienvenue sur Netflips, {member.name} !",
-            description=f"Nous sommes ravis de te compter parmi nous, {member.mention} !\n"
-                        "N'hésite pas à explorer nos catalogues de films, séries, jeux et logiciels.",
-            color=discord.Color.from_rgb(229, 9, 20) # Rouge Netflips (hex #e50914)
-        )
-        
-        if member.avatar:
-            embed.set_thumbnail(url=member.avatar.url)
-        else:
-            embed.set_thumbnail(url=member.default_avatar.url)
+    added_seasons_count = 0
+    updated_seasons_count = 0
+    errors = []
 
-        embed.set_footer(text=f"A rejoint le serveur le {member.joined_at.strftime('%d/%m/%Y à %H:%M')}")
+    seasons_list = [s.strip() for s in saisons_data.split(',')]
+    for season_entry in seasons_list:
+        if ':' not in season_entry:
+            errors.append(f"Format invalide pour une saison: '{season_entry}'. Attendu 'SX:url'.")
+            continue
         
         try:
-            await welcome_channel.send(embed=embed)
-        except discord.Forbidden:
-            print(f"Erreur: Je n'ai pas les permissions d'envoyer des messages dans le salon '{welcome_channel.name}'.")
-        except Exception as e:
-            print(f"Erreur lors de l'envoi du message de bienvenue : {e}")
-    else:
-        print(f"AVERTISSEMENT : Le salon de bienvenue '{WELCOME_CHANNEL_NAME}' n'a pas été trouvé. Veuillez vérifier la constante WELCOME_CHANNEL_NAME.")
+            season_part, url = season_entry.split(':', 1) 
+            
+            season_number_str = season_part.strip().upper().replace('S', '')
+            if not season_number_str.isdigit():
+                errors.append(f"Numéro de saison invalide dans '{season_entry}'. Attendu 'S' suivi d'un nombre.")
+                continue
 
-# ---------- Lancement du Bot ----------
-# Assurez-vous que votre TOKEN est défini quelque part, par exemple via une variable d'environnement ou dans un fichier config.py
-# Exemple : bot.run(os.getenv("DISCORD_TOKEN"))
-# Remplacez ceci par la ligne qui lance votre bot avec votre token
-# bot.run("VOTRE_TOKEN_ICI") # Mettez votre token ici si vous ne le chargez pas depuis une variable d'environnement ou un fichier.
+            season_number = int(season_number_str)
+            season_url = url.strip()
+            season_title = f"Saison {season_number}" 
+            
+            if not season_url.startswith("http://") and not season_url.startswith("https://"): 
+                 errors.append(f"L'URL pour la saison {season_number} ('{season_url}') est invalide. Doit commencer par http:// ou https://.")
+                 continue
+
+            season_found = False
+            for i, existing_season in enumerate(current_data[key]["seasons"]):
+                if existing_season.get("number") == season_number:
+                    current_data[key]["seasons"][i]["url"] = season_url
+                    current_data[key]["seasons"][i]["title"] = season_title 
+                    updated_seasons_count += 1
+                    season_found = True
+                    break
+            
+            if not season_found:
+                current_data[key]["seasons"].append({
+                    "number": season_number,
+                    "title": season_title,
+                    "url": season_url
+                })
+                added_seasons_count += 1
+
+        except ValueError:
+            errors.append(f"Erreur de conversion du numéro de saison pour '{season_entry}'.")
+        except Exception as e:
+            errors.append(f"Erreur lors du traitement de la saison '{season_entry}': {e}")
+    
+    current_data[key]["seasons"].sort(key=lambda s: s.get('number', 0))
+
+    save_data("series", current_data)
+
+    final_response = [response_msg_start]
+    if added_seasons_count > 0:
+        final_response.append(f"**{added_seasons_count}** saison(s) ajoutée(s).")
+    if updated_seasons_count > 0:
+        final_response.append(f"**{updated_seasons_count}** saison(s) mise(s) à jour.")
+    
+    if not added_seasons_count and not updated_seasons_count and not errors:
+        final_response.append("Aucune saison ajoutée ou mise à jour. Vérifiez le format de 'saisons_data'.")
+    if errors:
+        final_response.append("⚠️ Erreur(s) rencontrée(s) :")
+        final_response.extend(errors)
+
+    embed = Embed(
+        title=f"Import/Mise à jour de la série : {titre.title()}",
+        description="\n".join(final_response),
+        color=0x1abc9c
+    )
+    if current_data[key].get("image"): 
+        embed.set_image(url=current_data[key]["image"])
+    if current_data[key].get("themes"):
+        embed.add_field(name="Genres/Thèmes", value=", ".join([t.title() for t in current_data[key]['themes']]), inline=False)
+    
+    await interaction.followup.send(embed=embed) 
+    await update_search_channel_embed(interaction.guild, "series")
+    await update_voice_channel_names_for_guild(interaction.guild)
+
+# ---------- Logique de Mise à Jour des Salons Vocaux ----------
+async def update_voice_channel_names_for_guild(guild: discord.Guild):
+    print(f"Updating voice channel names for guild: {guild.name}")
+    for category, channel_base_name in VOICE_CHANNEL_MAP.items():
+        current_category_data = load_data(category)
+        count = len(current_category_data)
+
+        pattern = re.compile(rf"^{re.escape(channel_base_name)}\s*:\s*\d+$|^{re.escape(channel_base_name)}$", re.IGNORECASE)
+
+        existing_channel = None
+        for vc in guild.voice_channels:
+            if pattern.match(vc.name):
+                existing_channel = vc
+                break
+
+        new_name = f"{channel_base_name} : {count}"
+
+        if existing_channel:
+            if existing_channel.name != new_name:
+                try:
+                    await existing_channel.edit(name=new_name)
+                    print(f"Updated voice channel '{existing_channel.name}' to '{new_name}' in guild '{guild.name}'.")
+                except discord.Forbidden:
+                    print(f"❌ Missing permissions to edit voice channel '{existing_channel.name}' in guild '{guild.name}'.")
+                except discord.HTTPException as e:
+                    print(f"❌ Failed to edit voice channel '{existing_channel.name}' in guild '{guild.name}': {e}")
+            else:
+                print(f"Voice channel '{new_name}' is already up to date in guild '{guild.name}'.")
+        else:
+            try:
+                await guild.create_voice_channel(new_name)
+                print(f"✅ Salon vocal '{new_name}' created for '{category}' in guild '{guild.name}'.")
+            except discord.Forbidden:
+                print(f"❌ Missing permissions to create voice channel '{new_name}' in guild '{guild.name}'.")
+            except Exception as e:
+                print(f"❌ Error creating voice channel '{new_name}' in guild '{guild.name}': {e}")
+
+@tasks.loop(minutes=30)
+async def periodic_voice_channel_update():
+    print("Running periodic voice channel update...")
+    for guild in bot.guilds:
+        await update_voice_channel_names_for_guild(guild)
+    print("Periodic voice channel update finished.")
+
+@periodic_voice_channel_update.before_loop
+async def before_periodic_voice_channel_update():
+    await bot.wait_until_ready()
+    print("Waiting for bot to be ready before starting voice channel update loop...")
+
+# --- Fonction d'aide pour mettre à jour les embeds des salons de recherche ---
+async def update_search_channel_embed(guild: discord.Guild, category: str):
+    category_channels = {
+        "films": "recherche_films",
+        "series": "recherche_series",
+        "jeux": "recherche_jeux",
+        "logiciels": "recherche_logiciels",
+    }
+    channel_name = category_channels.get(category)
+    if channel_name:
+        search_channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if search_channel:
+            search_embed = create_search_embed(category)
+            
+            search_view = None
+            # Déterminer la vue correcte en fonction de la catégorie
+            if category == "films":
+                search_view = FilmSearchView()
+            elif category == "series":
+                search_view = SerieSearchView()
+            elif category == "jeux":
+                search_view = JeuSearchView()
+            elif category == "logiciels":
+                search_view = LogicielSearchView()
+            
+            if search_view:
+                try:
+                    await send_and_cleanup_embed(search_channel, search_embed, search_view, bot.user)
+                    print(f"Updated {category.title()} search embed in #{channel_name} for guild {guild.name}.")
+                except Exception as e:
+                    print(f"❌ Error updating {category.title()} search embed in #{channel_name} for guild {guild.name}: {e}")
+
+# ---------- Événement de Démarrage du Bot (on_ready) ----------
+@bot.event
+async def on_ready():
+    print(f"✅ Bot est connecté à Discord en tant que {bot.user}")
+
+    print("Tentative de synchronisation des commandes slash...")
+    try:
+        synced_commands = await bot.tree.sync()
+        print(f"✅ {len(synced_commands)} commandes slash synchronisées.")
+    except Exception as e:
+        print(f"❌ Échec de la synchronisation des commandes slash : {e}")
+
+    print("Démarrage de la boucle de mise à jour périodique des salons vocaux...")
+    if not periodic_voice_channel_update.is_running():
+        periodic_voice_channel_update.start()
+        print("Boucle de mise à jour périodique des salons vocaux démarrée.")
+    else:
+        print("Boucle de mise à jour périodique des salons vocaux déjà en cours.")
+
+    for guild in bot.guilds:
+        print(f"Traitement du serveur : {guild.name} (ID: {guild.id})")
+
+        print(f"Vérification/Création/Mise à jour des salons vocaux pour le serveur : {guild.name}")
+        await update_voice_channel_names_for_guild(guild)
+
+        demande_channel = discord.utils.get(guild.text_channels, name="demande")
+        if demande_channel:
+            print(f"Mise en place du salon #demande dans le serveur {guild.name}...")
+            ticket_embed = discord.Embed(
+                title="Besoin d'aide ?",
+                description="Clique sur le bouton ci-dessous pour ouvrir un ticket et obtenir de l'aide.",
+                color=0x00ff00
+            )
+            ticket_view = TicketView()
+            try:
+                await send_and_cleanup_embed(demande_channel, ticket_embed, ticket_view, bot.user)
+                print(f"Embed de ticket mis à jour pour #demande dans {guild.name}.")
+            except Exception as e:
+                print(f"❌ Erreur lors de la mise en place de #demande dans {guild.name}: {e}")
+        else:
+            print(f"Le salon texte 'demande' n'a pas été trouvé dans le serveur '{guild.name}'. Ignoré la mise en place.")
+
+        category_channels = {
+            "films": "recherche_films",
+            "series": "recherche_series",
+            "jeux": "recherche_jeux",
+            "logiciels": "recherche_logiciels",
+        }
+        for category, channel_name in category_channels.items():
+            search_channel = discord.utils.get(guild.text_channels, name=channel_name)
+            if search_channel:
+                print(f"Mise en place du salon #{channel_name} dans le serveur {guild.name}...")
+                search_embed = create_search_embed(category)
+                
+                search_view = None
+                if category == "films":
+                    search_view = FilmSearchView()
+                elif category == "series":
+                    search_view = SerieSearchView()
+                elif category == "jeux":
+                    search_view = JeuSearchView()
+                elif category == "logiciels":
+                    search_view = LogicielSearchView()
+                
+                if search_view:
+                    try:
+                        await send_and_cleanup_embed(search_channel, search_embed, search_view, bot.user)
+                        print(f"Embed de recherche {category.title()} mis à jour pour #{channel_name} dans {guild.name}.")
+                    except Exception as e:
+                        print(f"❌ Erreur lors de la mise en place de #{channel_name} dans {guild.name}: {e}")
+            else:
+                print(f"Le salon de recherche '{channel_name}' n'a pas été trouvé dans le serveur '{guild.name}'. Ignoré la mise en place.")
+
+    print("Le bot est entièrement opérationnel ! Toutes les tâches de configuration ont été tentées.")
+
+# Remplacez "YOUR_BOT_TOKEN_HERE" par le token réel de votre bot
+# bot.run("YOUR_BOT_TOKEN_HERE")une variable d'environnement ou un fichier.
 keep_alive()
 bot.run(token=token)
+
 
 
