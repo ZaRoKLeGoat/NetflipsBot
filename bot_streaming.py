@@ -12,6 +12,8 @@ from discord.ext import commands, tasks
 from discord import app_commands, Embed, PermissionOverwrite
 import discord.ui as ui
 
+load_dotenv()
+token = os.getenv('DISCORD_TOKEN')
 # ---------- Constantes ----------
 DATA_FILES = {
     "films": "data/films.json",
